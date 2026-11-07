@@ -215,8 +215,10 @@ and `ac.ts` ports them.
 
 - With its internet blocked at the router, the module has kept working. Others have reported
   offline units boot-looping; that hasn't happened here so far.
-- The module occasionally drops a request while the AC changes state (seen once on power-on right
-  after power-off). Resending the full set-state frame fixes it, and the frame is idempotent.
+- After about 2 minutes idle the module usually goes quiet: a new session still connects and
+  handshakes, but its requests get no reply, resends on that session included. A 1 s pause after the
+  handshake didn't fix it. A fresh session answers at once, so reconnect on timeout rather than
+  resend; query + set again is harmless, since the set frame carries the full state.
 - The module didn't answer broadcast discovery on the LAN, only unicast.
 - An appliance set command always carries the complete state: query first, change, then send it all
   back.

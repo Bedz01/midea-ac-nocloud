@@ -15,7 +15,7 @@ const CONFIG_DIR  = join(homedir(), ".config", "aircon");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const DISC_PORT   = 6445;
 const TIMEOUT     = 5000;   // connect and handshake
-const REPLY_MS    = 2500;   // per attempt; requests are resent on timeout
+const REPLY_MS    = 2500;   // per session; a timeout reconnects (see withSession)
 const ATTEMPTS    = 3;
 
 const DISCOVERY_MSG = Buffer.from("5a5a011148009200" + "00".repeat(32)
@@ -273,19 +273,27 @@ class Session {
     }
 
     // Sends a frame and returns the next state report (0xC0); other reports are skipped.
-    // Resends on timeout: the module sometimes drops a request while the AC changes state, and
-    // set frames carry the full state, so a repeat is harmless.
     async exchange(frame: Buffer): Promise<State> {
-        for(let attempt = 1; ; attempt++){
-            this.sendFrame(frame);
-            try{
-                for(;;){
-                    const f = await this.readFrame();
-                    if(f[10] === 0xC0) return parseState(f.subarray(10, f.length - 2));
-                }
-            } catch(e){
-                if(!(e instanceof AcTimeout) || attempt >= ATTEMPTS) throw e;
-            }
+        this.sendFrame(frame);
+        for(;;){
+            const f = await this.readFrame();
+            if(f[10] === 0xC0) return parseState(f.subarray(10, f.length - 2));
+        }
+    }
+}
+
+// Runs fn on a fresh session, reconnecting on timeout. After about 2 minutes idle the module still
+// connects and handshakes but never answers that session, resends included; a new session answers
+// at once. Set frames carry the full state, so redoing query + set is harmless.
+async function withSession<T>(cfg: Config, fn: (s: Session) => Promise<T>): Promise<T> {
+    for(let attempt = 1; ; attempt++){
+        const s = await Session.open(cfg);
+        try{
+            return await fn(s);
+        } catch(e){
+            if(!(e instanceof AcTimeout) || attempt >= ATTEMPTS) throw e;
+        } finally{
+            s.close();
         }
     }
 }
@@ -443,22 +451,17 @@ async function main(argv: string[]): Promise<void> {
         const psk = await readHidden(`Password for ${ssid}: `);
         const cfg: Config = { ip, port: d.port, deviceId: d.deviceId.toString(16), mac: d.mac.toString("hex"),
                               key: deriveKey(ssid, psk, d.mac).toString("hex") };
-        const s = await Session.open(cfg);
-        try{ show(await s.exchange(queryFrame())); } finally{ s.close(); }
+        show(await withSession(cfg, s => s.exchange(queryFrame())));
         saveConfig(cfg);
         console.log(`key OK, saved to ${CONFIG_FILE}`);
         return;
     }
 
     if(verb !== "status") applyArgs(argv, {} as State);   // reject bad arguments before connecting
-    const session = await Session.open(loadConfig());
-    try{
-        const state = await session.exchange(queryFrame());
-        if(verb === "status"){ show(state); return; }
-        show(await session.exchange(setFrame(applyArgs(argv, state))));
-    } finally{
-        session.close();
-    }
+    show(await withSession(loadConfig(), async s => {
+        const state = await s.exchange(queryFrame());
+        return verb === "status" ? state : s.exchange(setFrame(applyArgs(argv, state)));
+    }));
 }
 
 if(import.meta.main) main(process.argv.slice(2)).catch(e => {
